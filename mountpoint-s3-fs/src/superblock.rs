@@ -593,10 +593,7 @@ impl SuperblockInner {
 
         let lookup = match lookup {
             Some(lookup) => lookup?,
-            None => {
-                let remote = self.remote_lookup(client, parent_ino, &name).await?;
-                self.update_from_remote(parent_ino, name, remote)?
-            }
+            None => self.remote_lookup_and_update(client, parent_ino, name).await?,
         };
 
         lookup.inode.verify_child(parent_ino, name.as_ref(), &self.prefix)?;
@@ -648,6 +645,18 @@ impl SuperblockInner {
         metrics::counter!("metadata_cache.cache_hit").increment(lookup.is_some().into());
 
         lookup
+    }
+
+    /// Lookup and inode from the remote client and update the parent inode with the result.
+    /// This method is combination of [remote_lookup] and [update_from_remote].
+    async fn remote_lookup_and_update<OC: ObjectClient>(
+        &self,
+        client: &OC,
+        parent_ino: InodeNo,
+        name: ValidName<'_>,
+    ) -> Result<LookedUp, InodeError> {
+        let remote = self.remote_lookup(client, parent_ino, &name).await?;
+        self.update_from_remote(parent_ino, name, remote)
     }
 
     /// Lookup an inode in the parent directory with the given name
