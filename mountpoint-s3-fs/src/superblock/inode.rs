@@ -208,6 +208,7 @@ impl Inode {
 
 /// A wrapper that prints useful customer-facing error messages for inodes by including the object
 /// key rather than just the inode number.
+#[derive(Clone)]
 pub struct InodeErrorInfo(Inode);
 
 impl Display for InodeErrorInfo {

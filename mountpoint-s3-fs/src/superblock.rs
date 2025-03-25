@@ -41,6 +41,7 @@ use crate::fs::CacheConfig;
 use crate::logging;
 use crate::prefix::Prefix;
 use crate::s3::S3Personality;
+use crate::singleflight::Singleflight;
 use crate::sync::atomic::{AtomicU64, Ordering};
 use crate::sync::{Arc, RwLock};
 
@@ -71,6 +72,7 @@ struct SuperblockInner {
     bucket: String,
     prefix: Prefix,
     inodes: RwLock<InodeMap>,
+    fetching_inodes: Singleflight<(InodeNo, String), Result<LookedUp, InodeError>>,
     negative_cache: NegativeCache,
     next_ino: AtomicU64,
     mount_time: OffsetDateTime,
@@ -102,6 +104,7 @@ impl Superblock {
             bucket: bucket.to_owned(),
             prefix: prefix.clone(),
             inodes: RwLock::new(inodes),
+            fetching_inodes: Singleflight::new(),
             negative_cache,
             next_ino: AtomicU64::new(2),
             mount_time,
@@ -593,6 +596,7 @@ impl SuperblockInner {
 
         let lookup = match lookup {
             Some(lookup) => lookup?,
+            None if allow_cache => self.remote_lookup_and_update_once(client, parent_ino, name).await?,
             None => self.remote_lookup_and_update(client, parent_ino, name).await?,
         };
 
@@ -643,6 +647,34 @@ impl SuperblockInner {
             None => trace!("no lookup available from cache"),
         }
         metrics::counter!("metadata_cache.cache_hit").increment(lookup.is_some().into());
+
+        lookup
+    }
+
+    /// Performs a remote lookup (same as [remote_lookup_and_update]) only once for given `parent_ino` and `name` combination.
+    async fn remote_lookup_and_update_once<OC: ObjectClient>(
+        &self,
+        client: &OC,
+        parent_ino: InodeNo,
+        name: ValidName<'_>,
+    ) -> Result<LookedUp, InodeError> {
+        let parent = self.get(parent_ino)?;
+        if parent.kind() != InodeKind::Directory {
+            return Err(InodeError::NotADirectory(parent.err()));
+        }
+
+        let dedup_key = (parent_ino, name.to_string());
+
+        let lookup = self
+            .fetching_inodes
+            .get_or_compute(dedup_key.clone(), || async move {
+                self.remote_lookup_and_update(client, parent_ino, name).await
+            })
+            .await;
+
+        // `remote_lookup_and_update` will update parent inode to insert cached value, and the subsequent calls
+        // will be served from the cache until it expires, so, we can remove the key from `fetching_inodes`.
+        self.fetching_inodes.remove(dedup_key);
 
         lookup
     }
@@ -1073,12 +1105,12 @@ impl InodeMap {
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Clone)]
 pub enum InodeError {
     /// Avoid constructing this directly, but use `InodeError::client_error` instead
     #[error("error from ObjectClient")]
     ClientError {
-        source: anyhow::Error,
+        source: Arc<anyhow::Error>,
         metadata: Box<ErrorMetadata>,
     },
     #[error("file {0:?} does not exist in parent inode {1}")]
@@ -1140,7 +1172,7 @@ impl InodeError {
         };
         let metadata = Box::new(metadata);
         InodeError::ClientError {
-            source: anyhow!(err).context(context),
+            source: Arc::new(anyhow!(err).context(context)),
             metadata,
         }
     }
