@@ -12,6 +12,7 @@ pub mod object;
 pub mod prefetch;
 pub mod prefix;
 pub mod s3;
+mod singleflight;
 mod superblock;
 mod sync;
 pub mod upload;
