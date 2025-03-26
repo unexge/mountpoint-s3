@@ -104,7 +104,7 @@ impl Superblock {
             bucket: bucket.to_owned(),
             prefix: prefix.clone(),
             inodes: RwLock::new(inodes),
-            fetching_inodes: Singleflight::new(),
+            fetching_inodes: Singleflight::new(config.cache_config.file_ttl),
             negative_cache,
             next_ino: AtomicU64::new(2),
             mount_time,
@@ -663,20 +663,11 @@ impl SuperblockInner {
             return Err(InodeError::NotADirectory(parent.err()));
         }
 
-        let dedup_key = (parent_ino, name.to_string());
-
-        let lookup = self
-            .fetching_inodes
-            .get_or_compute(dedup_key.clone(), || async move {
+        self.fetching_inodes
+            .get_or_compute((parent_ino, name.to_string()), || async move {
                 self.remote_lookup_and_update(client, parent_ino, name).await
             })
-            .await;
-
-        // `remote_lookup_and_update` will update parent inode to insert cached value, and the subsequent calls
-        // will be served from the cache until it expires, so, we can remove the key from `fetching_inodes`.
-        self.fetching_inodes.remove(dedup_key);
-
-        lookup
+            .await
     }
 
     /// Lookup and inode from the remote client and update the parent inode with the result.

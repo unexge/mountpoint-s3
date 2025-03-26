@@ -168,7 +168,7 @@ where
             cache_config: config.cache_config.clone(),
             s3_personality: config.s3_personality,
         };
-        let superblock = Superblock::new(bucket, prefix, superblock_config);
+        let superblock = Superblock::new(bucket, prefix, superblock_config.clone());
         let mem_limiter = Arc::new(MemoryLimiter::new(client.clone(), config.mem_limit));
         let uploader = Uploader::new(
             client.clone(),
@@ -191,7 +191,7 @@ where
             next_handle: AtomicU64::new(1),
             dir_handles: AsyncRwLock::new(HashMap::new()),
             file_handles: AsyncRwLock::new(HashMap::new()),
-            inflight_reads: Singleflight::new(),
+            inflight_reads: Singleflight::new(superblock_config.cache_config.file_ttl),
         }
     }
 
