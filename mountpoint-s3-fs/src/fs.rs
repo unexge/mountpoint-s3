@@ -480,10 +480,9 @@ where
 
         // TODO: Correct value.
         if self.config.cache_config.serve_lookup_from_cache {
-            let dedup_key = (fh, offset as u64, size as usize);
-            let bytes = self
+            return self
                 .inflight_reads
-                .get_or_compute(dedup_key, || async move {
+                .get_or_compute((fh, offset as u64, size as usize), || async move {
                     request
                         .read(offset as u64, size as usize)
                         .await?
@@ -491,8 +490,6 @@ where
                         .map_err(|e| err!(libc::EIO, source:e, "integrity error"))
                 })
                 .await;
-
-            return bytes;
         }
 
         request
