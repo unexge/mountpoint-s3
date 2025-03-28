@@ -15,8 +15,8 @@ use fuser::{MountOption, Session};
 use futures::executor::block_on;
 use futures::task::Spawn;
 use mountpoint_s3_client::config::{
-    AddressingStyle, Allocator, EndpointConfig, EventLoopGroup, S3ClientAuthConfig, S3ClientConfig, SigningAlgorithm,
-    Uri, AWSCRT_LOG_TARGET,
+    AddressingStyle, Allocator, CredentialsProvider, EndpointConfig, EventLoopGroup, S3ClientAuthConfig,
+    S3ClientConfig, SigningAlgorithm, Uri, AWSCRT_LOG_TARGET,
 };
 use mountpoint_s3_client::error::ObjectClientError;
 use mountpoint_s3_client::instance_info::InstanceInfo;
@@ -124,6 +124,13 @@ Learn more in Mountpoint's configuration documentation (CONFIGURATION.md).\
 
     #[clap(long, help = "Use a specific profile from your credential file.", help_heading = AWS_CREDENTIALS_OPTIONS_HEADER)]
     pub profile: Option<String>,
+
+    #[clap(
+        long,
+        help = "Use AWS Rust SDK's default credential provider to obtain credentials.",
+        help_heading = AWS_CREDENTIALS_OPTIONS_HEADER
+    )]
+    pub use_rust_sdk_credential_provider: bool,
 
     #[clap(
         long,
@@ -776,6 +783,8 @@ pub fn create_s3_client(
         S3ClientAuthConfig::NoSigning
     } else if let Some(profile_name) = &args.profile {
         S3ClientAuthConfig::Profile(profile_name.to_owned())
+    } else if args.use_rust_sdk_credential_provider {
+        S3ClientAuthConfig::Provider(CredentialsProvider::new_rust_sdk_default_chain(&Allocator::default()).unwrap())
     } else {
         S3ClientAuthConfig::Default
     };

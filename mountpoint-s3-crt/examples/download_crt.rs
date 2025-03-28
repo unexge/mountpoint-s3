@@ -7,7 +7,7 @@ use anyhow::{anyhow, Context};
 use clap::Parser;
 use futures::channel::oneshot;
 use futures::executor::block_on;
-use mountpoint_s3_crt::auth::credentials::{CredentialsProvider, CredentialsProviderChainDefaultOptions};
+use mountpoint_s3_crt::auth::credentials::CredentialsProvider;
 use mountpoint_s3_crt::auth::signing_config::SigningAlgorithm;
 use mountpoint_s3_crt::common::allocator::Allocator;
 use mountpoint_s3_crt::common::rust_log_adapter::RustLogAdapter;
@@ -99,7 +99,7 @@ impl CrtClient {
             event_loop_group: &mut event_loop_group,
             host_resolver: &mut host_resolver,
         };
-        let mut client_bootstrap = ClientBootstrap::new(&allocator, &bootstrap_options).unwrap();
+        let client_bootstrap = ClientBootstrap::new(&allocator, &bootstrap_options).unwrap();
 
         let mut retry_strategy_options = StandardRetryOptions::default(&mut event_loop_group);
         // Match the SDK "legacy" retry strategies
@@ -108,11 +108,7 @@ impl CrtClient {
         retry_strategy_options.backoff_retry_options.jitter_mode = ExponentialBackoffJitterMode::Full;
         let retry_strategy = RetryStrategy::standard(&allocator, &retry_strategy_options).unwrap();
 
-        let credentials_chain_default_options = CredentialsProviderChainDefaultOptions {
-            bootstrap: &mut client_bootstrap,
-        };
-        let credentials_provider =
-            CredentialsProvider::new_chain_default(&allocator, credentials_chain_default_options)?;
+        let credentials_provider = CredentialsProvider::new_rust_sdk_default_chain(&allocator)?;
         let signing_config = init_signing_config(&config.region, credentials_provider.clone(), None, None, None);
 
         let mut client_config = ClientConfig::new();
@@ -221,7 +217,7 @@ struct CliArgs {
 }
 
 fn main() -> anyhow::Result<()> {
-    RustLogAdapter::try_init().context("failed to inititalize RustLogAdapter")?;
+    RustLogAdapter::try_init().context("failed to initialize RustLogAdapter")?;
     tracing_subscriber::fmt::try_init().map_err(|e| anyhow!("failed to initialize tracing subscriber: {:?}", e))?;
 
     let args = CliArgs::parse();
