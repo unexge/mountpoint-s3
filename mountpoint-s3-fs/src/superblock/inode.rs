@@ -528,7 +528,7 @@ impl WriteHandle {
 }
 
 /// Handle for a file being read
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ReadHandle {
     inode: Inode,
 }

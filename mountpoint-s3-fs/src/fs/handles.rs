@@ -1,4 +1,5 @@
 use std::str::FromStr as _;
+use std::sync::Arc;
 
 use mountpoint_s3_client::types::ETag;
 use mountpoint_s3_client::ObjectClient;
@@ -65,7 +66,7 @@ where
     /// The file handle has been assigned as a read handle
     Read {
         handle: ReadHandle,
-        request: Prefetcher::PrefetchResult<Client>,
+        request: Arc<AsyncMutex<Prefetcher::PrefetchResult<Client>>>,
     },
     /// The file handle has been assigned as a write handle
     Write(UploadState<Client>),
@@ -152,7 +153,10 @@ where
             object_id,
             object_size,
         );
-        let handle = FileHandleState::Read { handle, request };
+        let handle = FileHandleState::Read {
+            handle,
+            request: Arc::new(AsyncMutex::new(request)),
+        };
         metrics::gauge!("fs.current_handles", "type" => "read").increment(1.0);
         Ok(handle)
     }

@@ -20,7 +20,7 @@ use crate::mem_limiter::MemoryLimiter;
 use crate::prefetch::{Prefetch, PrefetchResult};
 use crate::prefix::Prefix;
 use crate::singleflight::Singleflight;
-use crate::superblock::{InodeError, InodeKind, LookedUp, ReaddirHandle, Superblock, SuperblockConfig};
+use crate::superblock::{InodeError, InodeKind, LookedUp, ReadHandle, ReaddirHandle, Superblock, SuperblockConfig};
 use crate::sync::atomic::{AtomicU64, Ordering};
 use crate::sync::{Arc, AsyncMutex, AsyncRwLock};
 use crate::upload::Uploader;
@@ -51,7 +51,7 @@ pub use time_to_live::TimeToLive;
 
 pub const FUSE_ROOT_INODE: InodeNo = 1u64;
 
-type InflightReadKey = (u64 /* fh */, u64 /* offset */, usize /* size */);
+type InflightReadKey = u64;
 
 #[derive(Debug)]
 pub struct S3Filesystem<Client, Prefetcher>
@@ -69,7 +69,8 @@ where
     next_handle: AtomicU64,
     dir_handles: AsyncRwLock<HashMap<u64, Arc<DirHandle>>>,
     file_handles: AsyncRwLock<HashMap<u64, Arc<FileHandle<Client, Prefetcher>>>>,
-    inflight_reads: Singleflight<InflightReadKey, Result<Bytes, Error>>,
+    inflight_reads:
+        Singleflight<InflightReadKey, Result<(ReadHandle, Arc<AsyncMutex<Prefetcher::PrefetchResult<Client>>>), Error>>,
 }
 
 /// Reply to a `lookup` call
@@ -380,6 +381,22 @@ where
         self.superblock.forget(ino, n);
     }
 
+    async fn read_handle_for(
+        &self,
+        lookup: &LookedUp,
+    ) -> Result<(ReadHandle, Arc<AsyncMutex<Prefetcher::PrefetchResult<Client>>>), Error> {
+        // TODO: Do this only if caching is enabled.
+        // TODO: Is `inode_no` correct granularity to share read handles?
+        self.inflight_reads
+            .get_or_compute(lookup.inode.ino(), || async move {
+                FileHandleState::new_read_handle(lookup, self).await.map(|h| match h {
+                    FileHandleState::Read { handle, request } => (handle, request),
+                    FileHandleState::Write(_) => unreachable!("We know this is a read handle"),
+                })
+            })
+            .await
+    }
+
     pub async fn open(&self, ino: InodeNo, flags: OpenFlags, pid: u32) -> Result<Opened, Error> {
         trace!("fs:open with ino {:?} flags {} pid {:?}", ino, flags, pid);
 
@@ -414,12 +431,14 @@ where
             } else {
                 // Otherwise, it must be a read handle.
                 debug!("fs:open choosing read handle for O_RDWR");
-                FileHandleState::new_read_handle(&lookup, self).await?
+                let (handle, request) = self.read_handle_for(&lookup).await?;
+                FileHandleState::Read { handle, request }
             }
         } else if flags.contains(OpenFlags::O_WRONLY) {
             FileHandleState::new_write_handle(&lookup, lookup.inode.ino(), flags, self).await?
         } else {
-            FileHandleState::new_read_handle(&lookup, self).await?
+            let (handle, request) = self.read_handle_for(&lookup).await?;
+            FileHandleState::Read { handle, request }
         };
 
         let inode = lookup.inode.clone();
@@ -474,24 +493,11 @@ where
         logging::record_name(handle.inode.name());
         let mut state = handle.state.lock().await;
         let request = match &mut *state {
-            FileHandleState::Read { request, .. } => request,
+            FileHandleState::Read { request, .. } => (*request).clone(),
             FileHandleState::Write(_) => return Err(err!(libc::EBADF, "file handle is not open for reads")),
         };
 
-        // TODO: Correct value.
-        if self.config.cache_config.serve_lookup_from_cache {
-            return self
-                .inflight_reads
-                .get_or_compute((fh, offset as u64, size as usize), || async move {
-                    request
-                        .read(offset as u64, size as usize)
-                        .await?
-                        .into_bytes()
-                        .map_err(|e| err!(libc::EIO, source:e, "integrity error"))
-                })
-                .await;
-        }
-
+        let mut request = request.lock().await;
         request
             .read(offset as u64, size as usize)
             .await?
