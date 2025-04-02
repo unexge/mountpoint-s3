@@ -353,7 +353,7 @@ fn main() -> anyhow::Result<()> {
     let args = CliArgs::parse();
 
     if args.foreground {
-        init_logging(args.logging_config()).context("failed to initialize logging")?;
+        let _logging = init_logging(args.logging_config()).context("failed to initialize logging")?;
 
         let _metrics = metrics::install();
 
@@ -378,7 +378,7 @@ fn main() -> anyhow::Result<()> {
         match pid.expect("Failed to fork mount process") {
             ForkResult::Child => {
                 let args = CliArgs::parse();
-                init_logging(args.logging_config()).context("failed to initialize logging")?;
+                let _logging = init_logging(args.logging_config()).context("failed to initialize logging")?;
 
                 let _metrics = metrics::install();
 
@@ -419,7 +419,7 @@ fn main() -> anyhow::Result<()> {
             ForkResult::Parent { child } => {
                 let args = CliArgs::parse();
 
-                init_logging(args.logging_config()).context("failed to initialize logging")?;
+                let _logging = init_logging(args.logging_config()).context("failed to initialize logging")?;
                 // close unused file descriptor, we only read from this end.
                 nix::unistd::close(write_fd).context("Failed to close unused file descriptor")?;
 
