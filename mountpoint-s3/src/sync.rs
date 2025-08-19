@@ -10,8 +10,8 @@ mod std {
     pub use std::sync::*;
     pub use std::thread;
 
-    pub use async_lock::Mutex as AsyncMutex;
-    pub use async_lock::RwLock as AsyncRwLock;
+    pub use tokio::sync::Mutex as AsyncMutex;
+    pub use tokio::sync::RwLock as AsyncRwLock;
 
     pub use async_channel;
 }

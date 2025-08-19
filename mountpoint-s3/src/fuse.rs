@@ -1,11 +1,12 @@
 //! Links _fuser_ method calls into Mountpoint's filesystem code in [crate::fs].
 
-use futures::executor::block_on;
 use mountpoint_s3_client::ObjectClient;
 use std::ffi::OsStr;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::SystemTime;
 use time::OffsetDateTime;
+use tokio::runtime::Runtime;
 use tracing::{field, instrument, Instrument};
 
 use crate::fs::{DirectoryEntry, DirectoryReplier, InodeNo, S3Filesystem, ToErrno};
@@ -65,34 +66,37 @@ macro_rules! fuse_unsupported {
 pub struct S3FuseFilesystem<Client, Prefetcher>
 where
     Client: ObjectClient + Clone + Send + Sync + 'static,
-    Prefetcher: Prefetch,
+    Prefetcher: Prefetch + Send + Sync + 'static,
 {
-    fs: S3Filesystem<Client, Prefetcher>,
+    fs: Arc<S3Filesystem<Client, Prefetcher>>,
+    rt: Runtime,
 }
 
 impl<Client, Prefetcher> S3FuseFilesystem<Client, Prefetcher>
 where
     Client: ObjectClient + Clone + Send + Sync + 'static,
-    Prefetcher: Prefetch,
+    Prefetcher: Prefetch + Send + Sync + 'static,
 {
     pub fn new(fs: S3Filesystem<Client, Prefetcher>) -> Self {
-        Self { fs }
+        let rt = Runtime::new().unwrap();
+        let fs = Arc::new(fs);
+        Self { fs, rt }
     }
 }
 
 impl<Client, Prefetcher> Filesystem for S3FuseFilesystem<Client, Prefetcher>
 where
     Client: ObjectClient + Clone + Send + Sync + 'static,
-    Prefetcher: Prefetch,
+    Prefetcher: Prefetch + Send + Sync + 'static,
 {
     #[instrument(level="warn", skip_all, fields(req=_req.unique()))]
     fn init(&self, _req: &Request<'_>, config: &mut KernelConfig) -> Result<(), libc::c_int> {
-        block_on(self.fs.init(config).in_current_span())
+        self.rt.block_on(self.fs.init(config).in_current_span())
     }
 
     #[instrument(level="warn", skip_all, fields(req=_req.unique(), ino=parent, name=?name))]
     fn lookup(&self, _req: &Request<'_>, parent: InodeNo, name: &OsStr, reply: ReplyEntry) {
-        match block_on(self.fs.lookup(parent, name).in_current_span()) {
+        match self.rt.block_on(self.fs.lookup(parent, name).in_current_span()) {
             Ok(entry) => reply.entry(&entry.ttl, &entry.attr, entry.generation),
             Err(e) => fuse_error!("lookup", reply, e),
         }
@@ -100,20 +104,29 @@ where
 
     #[instrument(level="warn", skip_all, fields(req=_req.unique(), ino=ino, name=field::Empty))]
     fn getattr(&self, _req: &Request<'_>, ino: InodeNo, _fh: Option<u64>, reply: ReplyAttr) {
-        match block_on(self.fs.getattr(ino).in_current_span()) {
-            Ok(attr) => reply.attr(&attr.ttl, &attr.attr),
-            Err(e) => fuse_error!("getattr", reply, e),
-        }
+        let fs = self.fs.clone();
+        self.rt.spawn(
+            async move {
+                match fs.getattr(ino).await {
+                    Ok(attr) => reply.attr(&attr.ttl, &attr.attr),
+                    Err(e) => fuse_error!("getattr", reply, e),
+                };
+            }
+            .in_current_span(),
+        );
     }
 
     #[instrument(level="warn", skip_all, fields(req=_req.unique(), ino, nlookup, name=field::Empty))]
     fn forget(&self, _req: &Request<'_>, ino: u64, nlookup: u64) {
-        block_on(self.fs.forget(ino, nlookup));
+        self.rt.block_on(self.fs.forget(ino, nlookup));
     }
 
     #[instrument(level="warn", skip_all, fields(req=req.unique(), ino=ino, pid=req.pid(), name=field::Empty))]
     fn open(&self, req: &Request<'_>, ino: InodeNo, flags: i32, reply: ReplyOpen) {
-        match block_on(self.fs.open(ino, flags.into(), req.pid()).in_current_span()) {
+        match self
+            .rt
+            .block_on(self.fs.open(ino, flags.into(), req.pid()).in_current_span())
+        {
             Ok(opened) => reply.opened(opened.fh, opened.flags),
             Err(e) => fuse_error!("open", reply, e),
         }
@@ -131,109 +144,116 @@ where
         lock: Option<u64>,
         reply: ReplyData,
     ) {
-        let mut bytes_sent = 0;
-
-        match block_on(self.fs.read(ino, fh, offset, size, flags, lock).in_current_span()) {
-            Ok(data) => {
-                bytes_sent = data.len();
-                reply.data(&data);
+        let fs = self.fs.clone();
+        self.rt.spawn(async move {
+            match fs.read(ino, fh, offset, size, flags, lock).in_current_span().await {
+                Ok(data) => {
+                    let bytes_sent = data.len();
+                    reply.data(&data);
+                    metrics::counter!("fuse.total_bytes", "type" => "read").increment(bytes_sent as u64);
+                    metrics::histogram!("fuse.io_size", "type" => "read").record(bytes_sent as f64);
+                }
+                Err(err) => fuse_error!("read", reply, err),
             }
-            Err(err) => fuse_error!("read", reply, err),
-        }
-
-        metrics::counter!("fuse.total_bytes", "type" => "read").increment(bytes_sent as u64);
-        metrics::histogram!("fuse.io_size", "type" => "read").record(bytes_sent as f64);
+        });
     }
 
     #[instrument(level="warn", skip_all, fields(req=_req.unique(), ino=parent, name=field::Empty))]
     fn opendir(&self, _req: &Request<'_>, parent: InodeNo, flags: i32, reply: ReplyOpen) {
-        match block_on(self.fs.opendir(parent, flags).in_current_span()) {
+        match self.rt.block_on(self.fs.opendir(parent, flags).in_current_span()) {
             Ok(opened) => reply.opened(opened.fh, opened.flags),
             Err(e) => fuse_error!("opendir", reply, e),
         }
     }
 
     #[instrument(level="warn", skip_all, fields(req=_req.unique(), ino=parent, fh=fh, offset=offset))]
-    fn readdir(&self, _req: &Request<'_>, parent: InodeNo, fh: u64, offset: i64, mut reply: fuser::ReplyDirectory) {
-        struct ReplyDirectory<'a> {
-            inner: &'a mut fuser::ReplyDirectory,
-            count: &'a mut usize,
-        }
-
-        impl DirectoryReplier for ReplyDirectory<'_> {
-            fn add(&mut self, entry: DirectoryEntry) -> bool {
-                let result = self.inner.add(entry.ino, entry.offset, entry.attr.kind, entry.name);
-                if !result {
-                    *self.count += 1;
+    fn readdir(&self, _req: &Request<'_>, parent: InodeNo, fh: u64, offset: i64, reply: fuser::ReplyDirectory) {
+        let fs = self.fs.clone();
+        self.rt.spawn(
+            async move {
+                struct ReplyDirectory<'a> {
+                    inner: &'a mut fuser::ReplyDirectory,
+                    count: &'a mut usize,
                 }
-                result
-            }
-        }
 
-        let mut count = 0;
-        let replier = ReplyDirectory {
-            inner: &mut reply,
-            count: &mut count,
-        };
+                impl DirectoryReplier for ReplyDirectory<'_> {
+                    fn add(&mut self, entry: DirectoryEntry) -> bool {
+                        let result = self.inner.add(entry.ino, entry.offset, entry.attr.kind, entry.name);
+                        if !result {
+                            *self.count += 1;
+                        }
+                        result
+                    }
+                }
 
-        match block_on(self.fs.readdir(parent, fh, offset, replier).in_current_span()) {
-            Ok(_) => {
-                reply.ok();
-                metrics::counter!("fuse.readdir.entries").increment(count as u64);
+                let mut count = 0;
+                let mut reply = reply;
+                let replier = ReplyDirectory {
+                    inner: &mut reply,
+                    count: &mut count,
+                };
+
+                match fs.readdir(parent, fh, offset, replier).await {
+                    Ok(_) => {
+                        reply.ok();
+                        metrics::counter!("fuse.readdir.entries").increment(count as u64);
+                    }
+                    Err(e) => fuse_error!("readdir", reply, e),
+                }
             }
-            Err(e) => fuse_error!("readdir", reply, e),
-        }
+            .in_current_span(),
+        );
     }
 
     #[instrument(level="warn", skip_all, fields(req=_req.unique(), ino=parent, fh=fh, offset=offset))]
-    fn readdirplus(
-        &self,
-        _req: &Request<'_>,
-        parent: InodeNo,
-        fh: u64,
-        offset: i64,
-        mut reply: fuser::ReplyDirectoryPlus,
-    ) {
-        struct ReplyDirectoryPlus<'a> {
-            inner: &'a mut fuser::ReplyDirectoryPlus,
-            count: &'a mut usize,
-        }
-
-        impl DirectoryReplier for ReplyDirectoryPlus<'_> {
-            fn add(&mut self, entry: DirectoryEntry) -> bool {
-                let result = self.inner.add(
-                    entry.ino,
-                    entry.offset,
-                    entry.name,
-                    &entry.ttl,
-                    &entry.attr,
-                    entry.generation,
-                );
-                if !result {
-                    *self.count += 1;
+    fn readdirplus(&self, _req: &Request<'_>, parent: InodeNo, fh: u64, offset: i64, reply: fuser::ReplyDirectoryPlus) {
+        let fs = self.fs.clone();
+        self.rt.spawn(
+            async move {
+                struct ReplyDirectoryPlus<'a> {
+                    inner: &'a mut fuser::ReplyDirectoryPlus,
+                    count: &'a mut usize,
                 }
-                result
-            }
-        }
 
-        let mut count = 0;
-        let replier = ReplyDirectoryPlus {
-            inner: &mut reply,
-            count: &mut count,
-        };
+                impl DirectoryReplier for ReplyDirectoryPlus<'_> {
+                    fn add(&mut self, entry: DirectoryEntry) -> bool {
+                        let result = self.inner.add(
+                            entry.ino,
+                            entry.offset,
+                            entry.name,
+                            &entry.ttl,
+                            &entry.attr,
+                            entry.generation,
+                        );
+                        if !result {
+                            *self.count += 1;
+                        }
+                        result
+                    }
+                }
 
-        match block_on(self.fs.readdirplus(parent, fh, offset, replier).in_current_span()) {
-            Ok(_) => {
-                reply.ok();
-                metrics::counter!("fuse.readdirplus.entries").increment(count as u64);
+                let mut count = 0;
+                let mut reply = reply;
+                let replier = ReplyDirectoryPlus {
+                    inner: &mut reply,
+                    count: &mut count,
+                };
+
+                match fs.readdirplus(parent, fh, offset, replier).await {
+                    Ok(_) => {
+                        reply.ok();
+                        metrics::counter!("fuse.readdirplus.entries").increment(count as u64);
+                    }
+                    Err(e) => fuse_error!("readdirplus", reply, e),
+                }
             }
-            Err(e) => fuse_error!("readdirplus", reply, e),
-        }
+            .in_current_span(),
+        );
     }
 
     #[instrument(level="warn", skip_all, fields(req=_req.unique(), ino=ino, fh=fh, datasync=datasync, name=field::Empty))]
     fn fsync(&self, _req: &Request<'_>, ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
-        match block_on(self.fs.fsync(ino, fh, datasync).in_current_span()) {
+        match self.rt.block_on(self.fs.fsync(ino, fh, datasync).in_current_span()) {
             Ok(()) => reply.ok(),
             Err(e) => fuse_error!("fsync", reply, e),
         }
@@ -241,7 +261,10 @@ where
 
     #[instrument(level="warn", skip_all, fields(req=req.unique(), ino=ino, fh=fh, pid=req.pid(), name=field::Empty))]
     fn flush(&self, req: &Request<'_>, ino: u64, fh: u64, lock_owner: u64, reply: ReplyEmpty) {
-        match block_on(self.fs.flush(ino, fh, lock_owner, req.pid()).in_current_span()) {
+        match self
+            .rt
+            .block_on(self.fs.flush(ino, fh, lock_owner, req.pid()).in_current_span())
+        {
             Ok(()) => reply.ok(),
             Err(e) => fuse_error!("flush", reply, e),
         }
@@ -258,7 +281,10 @@ where
         flush: bool,
         reply: ReplyEmpty,
     ) {
-        match block_on(self.fs.release(ino, fh, flags, lock_owner, flush).in_current_span()) {
+        match self
+            .rt
+            .block_on(self.fs.release(ino, fh, flags, lock_owner, flush).in_current_span())
+        {
             Ok(()) => reply.ok(),
             Err(e) => fuse_error!("release", reply, e),
         }
@@ -266,7 +292,7 @@ where
 
     #[instrument(level="warn", skip_all, fields(req=_req.unique(), ino=ino, fh=fh))]
     fn releasedir(&self, _req: &Request<'_>, ino: u64, fh: u64, flags: i32, reply: ReplyEmpty) {
-        match block_on(self.fs.releasedir(ino, fh, flags).in_current_span()) {
+        match self.rt.block_on(self.fs.releasedir(ino, fh, flags).in_current_span()) {
             Ok(()) => reply.ok(),
             Err(e) => fuse_error!("releasedir", reply, e),
         }
@@ -286,7 +312,10 @@ where
         // mode_t is u32 on Linux but u16 on macOS, so cast it here
         let mode = mode as libc::mode_t;
 
-        match block_on(self.fs.mknod(parent, name, mode, umask, rdev).in_current_span()) {
+        match self
+            .rt
+            .block_on(self.fs.mknod(parent, name, mode, umask, rdev).in_current_span())
+        {
             Ok(entry) => reply.entry(&entry.ttl, &entry.attr, entry.generation),
             Err(e) => fuse_error!("mknod", reply, e),
         }
@@ -297,7 +326,10 @@ where
         // mode_t is u32 on Linux but u16 on macOS, so cast it here
         let mode = mode as libc::mode_t;
 
-        match block_on(self.fs.mkdir(parent, name, mode, umask).in_current_span()) {
+        match self
+            .rt
+            .block_on(self.fs.mkdir(parent, name, mode, umask).in_current_span())
+        {
             Ok(entry) => reply.entry(&entry.ttl, &entry.attr, entry.generation),
             Err(e) => fuse_error!("mkdir", reply, e),
         }
@@ -316,7 +348,7 @@ where
         lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        match block_on(
+        match self.rt.block_on(
             self.fs
                 .write(ino, fh, offset, data, write_flags, flags, lock_owner)
                 .in_current_span(),
@@ -332,18 +364,32 @@ where
 
     #[instrument(level="warn", skip_all, fields(req=_req.unique(), parent=parent, name=?name))]
     fn rmdir(&self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        match block_on(self.fs.rmdir(parent, name).in_current_span()) {
-            Ok(()) => reply.ok(),
-            Err(e) => fuse_error!("rmdir", reply, e),
-        }
+        let fs = self.fs.clone();
+        let name = name.to_owned();
+        self.rt.spawn(
+            async move {
+                match fs.rmdir(parent, &name).await {
+                    Ok(()) => reply.ok(),
+                    Err(e) => fuse_error!("rmdir", reply, e),
+                }
+            }
+            .in_current_span(),
+        );
     }
 
     #[instrument(level="warn", skip_all, fields(req=_req.unique(), parent=parent, name=?name))]
     fn unlink(&self, _req: &Request<'_>, parent: InodeNo, name: &OsStr, reply: ReplyEmpty) {
-        match block_on(self.fs.unlink(parent, name).in_current_span()) {
-            Ok(()) => reply.ok(),
-            Err(e) => fuse_error!("unlink", reply, e),
-        }
+        let fs = self.fs.clone();
+        let name = name.to_owned();
+        self.rt.spawn(
+            async move {
+                match fs.unlink(parent, &name).await {
+                    Ok(()) => reply.ok(),
+                    Err(e) => fuse_error!("unlink", reply, e),
+                }
+            }
+            .in_current_span(),
+        );
     }
 
     #[instrument(level="warn", skip_all, fields(req=_req.unique(), ino=ino, name=field::Empty))]
@@ -365,6 +411,7 @@ where
         flags: Option<u32>,
         reply: ReplyAttr,
     ) {
+        let fs = self.fs.clone();
         let atime = atime.map(|t| match t {
             TimeOrNow::SpecificTime(st) => OffsetDateTime::from(st),
             TimeOrNow::Now => OffsetDateTime::now_utc(),
@@ -373,10 +420,15 @@ where
             TimeOrNow::SpecificTime(st) => OffsetDateTime::from(st),
             TimeOrNow::Now => OffsetDateTime::now_utc(),
         });
-        match block_on(self.fs.setattr(ino, atime, mtime, size, flags).in_current_span()) {
-            Ok(attr) => reply.attr(&attr.ttl, &attr.attr),
-            Err(e) => fuse_error!("setattr", reply, e),
-        }
+        self.rt.spawn(
+            async move {
+                match fs.setattr(ino, atime, mtime, size, flags).await {
+                    Ok(attr) => reply.attr(&attr.ttl, &attr.attr),
+                    Err(e) => fuse_error!("setattr", reply, e),
+                }
+            }
+            .in_current_span(),
+        );
     }
 
     // Everything below here is stubs for unsupported functions so we log them correctly
@@ -583,7 +635,7 @@ where
 
     #[instrument(level="warn", skip_all, fields(req=_req.unique(), ino=ino))]
     fn statfs(&self, _req: &Request<'_>, ino: u64, reply: ReplyStatfs) {
-        match block_on(self.fs.statfs(ino).in_current_span()) {
+        match self.rt.block_on(self.fs.statfs(ino).in_current_span()) {
             Ok(statfs) => reply.statfs(
                 statfs.total_blocks,
                 statfs.free_blocks,
