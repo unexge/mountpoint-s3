@@ -27,6 +27,7 @@ csv = { version = "1.3.1", optional = true }
 ctrlc = { version = "3.4.7", features = ["termination"] }
 dashmap = "6.1.0"
 futures = "0.3.31"
+io-uring = "0.7"
 hdrhistogram = { version = "7.5.4", default-features = false }
 hex = "0.4.3"
 humansize = "2.1.3"

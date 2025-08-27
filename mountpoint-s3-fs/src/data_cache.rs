@@ -10,7 +10,10 @@ mod express_data_cache;
 mod in_memory_data_cache;
 mod multilevel_cache;
 
+use std::ops::Range;
+
 use async_trait::async_trait;
+use futures::{Stream, stream};
 use thiserror::Error;
 
 pub use crate::checksums::ChecksummedBytes;
@@ -24,6 +27,8 @@ use crate::object::ObjectId;
 
 /// Indexes blocks within a given object.
 pub type BlockIndex = u64;
+
+pub type BlockRange = Range<BlockIndex>;
 
 /// Errors returned by operations on a [DataCache]
 #[derive(Debug, Error)]
@@ -73,6 +78,24 @@ pub trait DataCache {
         block_offset: u64,
         object_size: usize,
     ) -> DataCacheResult<Option<ChecksummedBytes>>;
+
+    /// Get multiple blocks of data from the cache for the given [ObjectId] and [BlockRange]s, if available.
+    fn get_blocks(
+        &self,
+        cache_key: ObjectId,
+        block_ranges: &[BlockRange],
+        object_size: usize,
+    ) -> DataCacheResult<impl Stream<Item = DataCacheResult<Option<ChecksummedBytes>>> + Send> {
+        Ok(block_ranges
+            .iter()
+            .map(|block_range| {
+                let block_size = block_range.end - block_range.start;
+                let block_idx = block_range.start / block_size;
+                let block_offset = block_range.start;
+                self.get_block(cache_key.clone(), block_idx, block_offset, object_size)
+            })
+            .collect::<stream::FuturesOrdered<_>>())
+    }
 
     /// Put block of data to the cache for the given [ObjectId] and [BlockIndex].
     async fn put_block(

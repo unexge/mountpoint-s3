@@ -1,7 +1,9 @@
 //! Module for the on-disk data cache implementation.
 
+use std::ffi::CString;
 use std::fs;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{Cursor, ErrorKind, Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -11,6 +13,9 @@ use bincode::config::{Configuration, Fixint, Limit, LittleEndian};
 use bincode::error::{DecodeError, EncodeError};
 use bincode::{Decode, Encode};
 use bytes::Bytes;
+use futures::StreamExt;
+use futures::{Stream, TryStreamExt, channel::mpsc};
+use io_uring::{IoUring, opcode, types};
 use linked_hash_map::LinkedHashMap;
 use mountpoint_s3_client::checksums::crc32c::{self, Crc32c};
 use sha2::{Digest, Sha256};
@@ -19,7 +24,7 @@ use thiserror::Error;
 use tracing::{trace, warn};
 
 use crate::checksums::IntegrityError;
-use crate::data_cache::DataCacheError;
+use crate::data_cache::{BlockRange, DataCacheError};
 use crate::memory::{BufferKind, PagedPool};
 use crate::object::ObjectId;
 use crate::sync::Mutex;
@@ -192,7 +197,11 @@ impl DiskBlockHeader {
         } else {
             warn!(
                 s3_key_match,
-                etag_match, block_idx_match, block_size_match, "block data did not match expected values",
+                etag_match,
+                block_idx_match,
+                block_offset_match,
+                block_size_match,
+                "block data did not match expected values",
             );
             Err(DiskBlockAccessError::FieldMismatchError)
         }
@@ -334,6 +343,7 @@ impl DiskDataCache {
             path = ?path.as_ref(),
             "reading cache block",
         );
+
         let mut file = match fs::File::open(path.as_ref()) {
             Ok(file) => file,
             Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
@@ -486,6 +496,81 @@ impl DataCache for DiskDataCache {
         }
     }
 
+    fn get_blocks(
+        &self,
+        cache_key: ObjectId,
+        block_ranges: &[BlockRange],
+        _object_size: usize,
+    ) -> DataCacheResult<impl Stream<Item = DataCacheResult<Option<ChecksummedBytes>>> + Send> {
+        assert!(block_ranges.len() > 0);
+
+        for block_range in block_ranges {
+            if (block_range.end - block_range.start) != self.config.block_size {
+                return Err(DataCacheError::InvalidBlockOffset);
+            }
+        }
+
+        const SPLIT_SIZE: usize = 1;
+
+        let block_size = self.block_size();
+        let cache_dir = self.config.cache_directory.join(CACHE_VERSION);
+
+        if block_ranges.len() <= SPLIT_SIZE {
+            let (sender, receiver) = mpsc::channel(block_ranges.len());
+            produce_blocks(
+                cache_key.clone(),
+                block_ranges,
+                cache_dir.clone(),
+                block_size,
+                self.pool.clone(),
+                sender.clone(),
+            )?;
+            return Ok(receiver.into_stream().boxed());
+        }
+
+        let (front, back) = block_ranges.split_at(SPLIT_SIZE);
+
+        let (front_sender, front_receiver) = mpsc::channel(SPLIT_SIZE);
+        let (back_sender, back_receiver) = mpsc::channel(block_ranges.len() - SPLIT_SIZE);
+
+        std::thread::spawn({
+            let back = back.to_owned();
+            let cache_key = cache_key.clone();
+            let cache_dir = cache_dir.clone();
+            let pool = self.pool.clone();
+            move || {
+                if let Err(error) = produce_blocks(
+                    cache_key.clone(),
+                    &back,
+                    cache_dir,
+                    block_size,
+                    pool,
+                    back_sender.clone(),
+                ) {
+                    tracing::error!(?error, "failed to prefetch blocks");
+                }
+            }
+        });
+        produce_blocks(
+            cache_key.clone(),
+            front,
+            cache_dir.clone(),
+            block_size,
+            self.pool.clone(),
+            front_sender.clone(),
+        )?;
+
+        fn prio_left(_: &mut ()) -> futures::stream::PollNext {
+            futures::stream::PollNext::Left
+        }
+
+        let stream =
+            futures::stream::select_with_strategy(front_receiver.into_stream(), back_receiver.into_stream(), prio_left)
+                .into_stream();
+
+        Ok(stream.boxed())
+    }
+
     async fn put_block(
         &self,
         cache_key: ObjectId,
@@ -533,6 +618,204 @@ impl DataCache for DiskDataCache {
     fn block_size(&self) -> u64 {
         self.config.block_size
     }
+}
+
+fn produce_blocks(
+    cache_key: ObjectId,
+    block_ranges: &[BlockRange],
+    cache_dir: PathBuf,
+    block_size: u64,
+    pool: PagedPool,
+    mut sender: mpsc::Sender<DataCacheResult<Option<ChecksummedBytes>>>,
+) -> DataCacheResult<()> {
+    let ok = Instant::now();
+    const RING_SIZE: u32 = 32;
+
+    let mut ring = IoUring::new(RING_SIZE).unwrap();
+
+    let get_path_for_block_key = |block_key: &DiskBlockKey| -> PathBuf {
+        let mut path = cache_dir.clone();
+        block_key.append_to_path(&mut path);
+        path
+    };
+
+    // TODO: Fix this.
+    const S3_KEY_MAX_SIZE: usize = 2048;
+    let block_file_size =
+        block_size as usize + std::mem::size_of::<DiskBlockHeader>() + S3_KEY_MAX_SIZE + CACHE_VERSION.len();
+    let mut blocks = {
+        let mut vec = Vec::with_capacity(RING_SIZE as _);
+        for _ in 0..RING_SIZE {
+            vec.push(Ok(None));
+        }
+        vec
+    };
+    let mut block_paths = {
+        let mut vec = Vec::with_capacity(RING_SIZE as _);
+        for _ in 0..RING_SIZE {
+            vec.push(None);
+        }
+        vec
+    };
+    let mut block_fds = Vec::with_capacity(RING_SIZE as _);
+    let mut buf = vec![0; block_file_size * RING_SIZE as usize];
+
+    for chunk in block_ranges.chunks(RING_SIZE as _) {
+        assert_eq!(blocks.capacity(), RING_SIZE as usize);
+        let start = Instant::now();
+
+        for (i, block_range) in chunk.iter().enumerate() {
+            let block_size = block_range.end - block_range.start;
+            let block_idx = block_range.start / block_size;
+
+            let block_key = DiskBlockKey::new(&cache_key.clone(), block_idx);
+            let path = get_path_for_block_key(&block_key);
+            let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+            block_paths[i] = Some(path);
+
+            let open_e = opcode::OpenAt::new(
+                types::Fd(libc::AT_FDCWD),
+                block_paths[i].as_ref().map(|x| x.as_ptr()).unwrap(),
+            )
+            .build()
+            .user_data(i as _);
+
+            // SAFETY: The pathname is valid for the duration of the ring.
+            unsafe {
+                ring.submission().push(&open_e).unwrap();
+            }
+        }
+
+        ring.submit_and_wait(chunk.len())?;
+
+        let mut num_cache_misses = 0;
+        for _ in 0..chunk.len() {
+            let cqe = ring.completion().next().unwrap();
+            let idx = cqe.user_data() as usize;
+            let fd = cqe.result();
+
+            if fd < 0 {
+                num_cache_misses += 1;
+                continue;
+            }
+
+            assert!(fd > 2);
+            block_fds.push(fd);
+
+            let read_e = opcode::Read::new(
+                types::Fd(fd),
+                buf[(idx * block_file_size)..].as_mut_ptr(),
+                block_file_size as _,
+            )
+            .build()
+            .user_data(idx as _);
+
+            // SAFETY: The buffer and the fd are valid for the duration of the ring.
+            unsafe {
+                ring.submission().push(&read_e).unwrap();
+            }
+        }
+
+        let num_submitted = chunk.len() - num_cache_misses;
+
+        ring.submit_and_wait(num_submitted)?;
+        tracing::warn!(elapsed = ?start.elapsed(), size = num_submitted, "load batch");
+
+        let start = Instant::now();
+        for _ in 0..num_submitted {
+            let cqe = ring.completion().next().unwrap();
+            let idx = cqe.user_data() as usize;
+            let block_range = &chunk[idx];
+            let block_size = block_range.end - block_range.start;
+            let block_idx = block_range.start / block_size;
+            let block_offset = block_range.start;
+
+            let block_key = DiskBlockKey::new(&cache_key.clone(), block_idx);
+            let path = get_path_for_block_key(&block_key);
+
+            if cqe.result() < 0 {
+                blocks[idx] = Err(DataCacheError::IoFailure(
+                    std::io::Error::from_raw_os_error(-cqe.result()).into(),
+                ));
+                continue;
+            }
+
+            let block_buf_pos = idx * (block_file_size as usize);
+            let block_buf = &buf[block_buf_pos..(block_buf_pos + (block_file_size as usize))];
+
+            let block_version = &block_buf[0..CACHE_VERSION.len()];
+            if block_version != CACHE_VERSION.as_bytes() {
+                warn!(
+                    found_version = ?block_version, expected_version = ?CACHE_VERSION,
+                    path = ?path,
+                    "stale block format found during reading"
+                );
+                blocks[idx] = Err(DataCacheError::InvalidBlockContent);
+                continue;
+            }
+
+            let block_data = &block_buf[CACHE_VERSION.len()..];
+            let mut block_data_cursor = Cursor::new(block_data);
+            let block = match DiskBlock::read(&mut block_data_cursor, block_size, &pool) {
+                Ok(block) => block,
+                Err(error) => {
+                    warn!(?error, path = ?path, "block could not be deserialized");
+                    blocks[idx] = Err(DataCacheError::InvalidBlockContent);
+                    continue;
+                }
+            };
+            let bytes = match block.data(&cache_key, block_idx, block_offset) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    blocks[idx] = Err(DataCacheError::InvalidBlockContent);
+                    continue;
+                }
+            };
+
+            blocks[idx] = Ok(Some(bytes));
+        }
+        tracing::warn!(elapsed = ?start.elapsed(), size = num_submitted, "calculated checksum");
+
+        for block in blocks.into_iter().take(chunk.len()) {
+            let is_err = block.is_err();
+            sender.try_send(block).expect("receiver side must not be dropped");
+            if is_err {
+                // If we encounter any errors, just terminate the stream after sending the first error.
+                break;
+            }
+        }
+
+        let num_block_fds = block_fds.len();
+        for block_fd in std::mem::take(&mut block_fds) {
+            let close_e = opcode::Close::new(types::Fd(block_fd)).build();
+            // SAFETY: The buffer is valid for the duration of the ring.
+            unsafe {
+                ring.submission().push(&close_e).unwrap();
+            }
+        }
+        ring.submit_and_wait(num_submitted)?;
+        for _ in 0..num_block_fds {
+            _ = ring.completion().next().unwrap();
+        }
+
+        blocks = {
+            let mut vec = Vec::with_capacity(RING_SIZE as usize);
+            for _ in 0..RING_SIZE {
+                vec.push(Ok(None));
+            }
+            vec
+        };
+        block_paths = {
+            let mut vec = Vec::with_capacity(RING_SIZE as _);
+            for _ in 0..RING_SIZE {
+                vec.push(None);
+            }
+            vec
+        };
+    }
+
+    tracing::warn!(elapsed = ?ok.elapsed(), size = block_ranges.len(), "produced blocks");
+    Ok(())
 }
 
 /// Key to identify a block in the disk cache, composed of a hash of the S3 key and Etag, and the block index.
