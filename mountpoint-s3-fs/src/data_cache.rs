@@ -68,7 +68,7 @@ pub trait DataCache {
     /// Operation may fail due to errors, or return [None] if the block was not available in the cache.
     async fn get_block(
         &self,
-        cache_key: &ObjectId,
+        cache_key: ObjectId,
         block_idx: BlockIndex,
         block_offset: u64,
         object_size: usize,

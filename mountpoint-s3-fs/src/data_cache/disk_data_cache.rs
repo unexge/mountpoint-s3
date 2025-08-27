@@ -450,7 +450,7 @@ fn hash_cache_key_raw(cache_key: &ObjectId) -> [u8; 32] {
 impl DataCache for DiskDataCache {
     async fn get_block(
         &self,
-        cache_key: &ObjectId,
+        cache_key: ObjectId,
         block_idx: BlockIndex,
         block_offset: u64,
         _object_size: usize,
@@ -459,9 +459,9 @@ impl DataCache for DiskDataCache {
             return Err(DataCacheError::InvalidBlockOffset);
         }
         let start = Instant::now();
-        let block_key = DiskBlockKey::new(cache_key, block_idx);
+        let block_key = DiskBlockKey::new(&cache_key, block_idx);
         let path = self.get_path_for_block_key(&block_key);
-        match self.read_block(&path, cache_key, block_idx, block_offset) {
+        match self.read_block(&path, &cache_key, block_idx, block_offset) {
             Ok(None) => {
                 // Cache miss.
                 metrics::counter!("disk_data_cache.block_hit").increment(0);
@@ -750,7 +750,7 @@ mod tests {
         );
 
         let block = cache
-            .get_block(&cache_key_1, 0, 0, object_1_size)
+            .get_block(cache_key_1.clone(), 0, 0, object_1_size)
             .await
             .expect("cache should be accessible");
         assert!(
@@ -764,7 +764,7 @@ mod tests {
             .await
             .expect("cache should be accessible");
         let entry = cache
-            .get_block(&cache_key_1, 0, 0, object_1_size)
+            .get_block(cache_key_1.clone(), 0, 0, object_1_size)
             .await
             .expect("cache should be accessible")
             .expect("cache entry should be returned");
@@ -779,7 +779,7 @@ mod tests {
             .await
             .expect("cache should be accessible");
         let entry = cache
-            .get_block(&cache_key_2, 0, 0, object_2_size)
+            .get_block(cache_key_2, 0, 0, object_2_size)
             .await
             .expect("cache should be accessible")
             .expect("cache entry should be returned");
@@ -794,7 +794,7 @@ mod tests {
             .await
             .expect("cache should be accessible");
         let entry = cache
-            .get_block(&cache_key_1, 1, block_size, object_1_size)
+            .get_block(cache_key_1.clone(), 1, block_size, object_1_size)
             .await
             .expect("cache should be accessible")
             .expect("cache entry should be returned");
@@ -805,7 +805,7 @@ mod tests {
 
         // Entry 1's first block still intact
         let entry = cache
-            .get_block(&cache_key_1, 0, 0, object_1_size)
+            .get_block(cache_key_1.clone(), 0, 0, object_1_size)
             .await
             .expect("cache should be accessible")
             .expect("cache entry should be returned");
@@ -837,7 +837,7 @@ mod tests {
             .await
             .expect("cache should be accessible");
         let entry = cache
-            .get_block(&cache_key, 0, 0, slice.len())
+            .get_block(cache_key, 0, 0, slice.len())
             .await
             .expect("cache should be accessible")
             .expect("cache entry should be returned");
@@ -865,7 +865,7 @@ mod tests {
 
         async fn is_block_in_cache(
             cache: &DiskDataCache,
-            cache_key: &ObjectId,
+            cache_key: ObjectId,
             block_idx: u64,
             expected_bytes: &ChecksummedBytes,
             object_size: usize,
@@ -943,7 +943,13 @@ mod tests {
 
         let count_small_object_blocks_in_cache = futures::stream::iter(small_object_blocks.iter().enumerate())
             .filter(|&(block_idx, bytes)| {
-                is_block_in_cache(&cache, &small_object_key, block_idx as u64, bytes, SMALL_OBJECT_SIZE)
+                is_block_in_cache(
+                    &cache,
+                    small_object_key.clone(),
+                    block_idx as u64,
+                    bytes,
+                    SMALL_OBJECT_SIZE,
+                )
             })
             .count()
             .await;
@@ -955,7 +961,13 @@ mod tests {
 
         let count_large_object_blocks_in_cache = futures::stream::iter(large_object_blocks.iter().enumerate())
             .filter(|&(block_idx, bytes)| {
-                is_block_in_cache(&cache, &large_object_key, block_idx as u64, bytes, LARGE_OBJECT_SIZE)
+                is_block_in_cache(
+                    &cache,
+                    large_object_key.clone(),
+                    block_idx as u64,
+                    bytes,
+                    LARGE_OBJECT_SIZE,
+                )
             })
             .count()
             .await;
@@ -1128,7 +1140,7 @@ mod tests {
             let handle = pool
                 .spawn_with_handle(async move {
                     let block = data_cache
-                        .get_block(&cache_key, block_idx, block_offset, object_size)
+                        .get_block(cache_key.clone(), block_idx, block_offset, object_size)
                         .await
                         .expect("get_block should not return error");
                     if block.is_none() {
