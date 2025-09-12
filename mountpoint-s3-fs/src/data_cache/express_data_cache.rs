@@ -290,13 +290,13 @@ where
 {
     async fn get_block(
         &self,
-        cache_key: &ObjectId,
+        cache_key: ObjectId,
         block_idx: BlockIndex,
         block_offset: u64,
         object_size: usize,
     ) -> DataCacheResult<Option<ChecksummedBytes>> {
         let start = Instant::now();
-        let (result, result_type) = match self.read_block(cache_key, block_idx, block_offset, object_size).await {
+        let (result, result_type) = match self.read_block(&cache_key, block_idx, block_offset, object_size).await {
             Ok(Some(data)) => {
                 metrics::counter!("express_data_cache.block_hit").increment(1);
                 metrics::counter!("express_data_cache.total_bytes", "type" => "read").increment(data.len() as u64);
@@ -527,7 +527,7 @@ mod tests {
         );
 
         let block = cache
-            .get_block(&cache_key_1, 0, 0, object_1_size)
+            .get_block(cache_key_1.clone(), 0, 0, object_1_size)
             .await
             .expect("cache should be accessible");
         assert!(
@@ -541,7 +541,7 @@ mod tests {
             .await
             .expect("cache should be accessible");
         let entry = cache
-            .get_block(&cache_key_1, 0, 0, object_1_size)
+            .get_block(cache_key_1.clone(), 0, 0, object_1_size)
             .await
             .expect("cache should be accessible")
             .expect("cache entry should be returned");
@@ -557,7 +557,7 @@ mod tests {
             .await
             .expect("cache should be accessible");
         let entry = cache
-            .get_block(&cache_key_2, 0, 0, object_2_size)
+            .get_block(cache_key_2.clone(), 0, 0, object_2_size)
             .await
             .expect("cache should be accessible")
             .expect("cache entry should be returned");
@@ -573,7 +573,7 @@ mod tests {
             .await
             .expect("cache should be accessible");
         let entry = cache
-            .get_block(&cache_key_1, 1, block_size, object_1_size)
+            .get_block(cache_key_1.clone(), 1, block_size, object_1_size)
             .await
             .expect("cache should be accessible")
             .expect("cache entry should be returned");
@@ -585,7 +585,7 @@ mod tests {
 
         // Entry 1's first block still intact
         let entry = cache
-            .get_block(&cache_key_1, 0, 0, object_1_size)
+            .get_block(cache_key_1.clone(), 0, 0, object_1_size)
             .await
             .expect("cache should be accessible")
             .expect("cache entry should be returned");
@@ -620,7 +620,7 @@ mod tests {
             .await
             .expect("cache should be accessible");
         let get_result = cache
-            .get_block(&cache_key_1, 0, 0, data_1.len())
+            .get_block(cache_key_1.clone(), 0, 0, data_1.len())
             .await
             .expect("cache should be accessible");
         assert!(get_result.is_none());
@@ -666,7 +666,7 @@ mod tests {
             .await
             .unwrap();
         let (received_data, _) = cache
-            .get_block(&cache_key, 0, 0, data.len())
+            .get_block(cache_key.clone(), 0, 0, data.len())
             .await
             .expect("get should succeed with intact metadata")
             .expect("block should be non-empty")
@@ -681,7 +681,7 @@ mod tests {
             .await
             .unwrap();
         let err = cache
-            .get_block(&cache_key, 0, 0, data.len())
+            .get_block(cache_key.clone(), 0, 0, data.len())
             .await
             .expect_err("cache should return error if checksum isn't present");
         assert!(matches!(err, DataCacheError::InvalidBlockChecksum));
@@ -698,7 +698,7 @@ mod tests {
             .await
             .unwrap();
         let err = cache
-            .get_block(&cache_key, 0, 0, data.len())
+            .get_block(cache_key.clone(), 0, 0, data.len())
             .await
             .expect_err("cache should return error if object metadata isn't present");
         assert!(matches!(err, DataCacheError::InvalidBlockHeader(_)));
@@ -722,7 +722,7 @@ mod tests {
             .await
             .unwrap();
         let err = cache
-            .get_block(&cache_key, 0, 0, data_2.len())
+            .get_block(cache_key.clone(), 0, 0, data_2.len())
             .await
             .expect_err("cache should return error if object metadata doesn't match data");
         assert!(matches!(err, DataCacheError::InvalidBlockHeader(_)));
@@ -741,14 +741,14 @@ mod tests {
             .await
             .unwrap();
         let err = cache
-            .get_block(&cache_key, 0, 0, data.len())
+            .get_block(cache_key.clone(), 0, 0, data.len())
             .await
             .expect_err("cache should return error if source bucket does not match");
         assert!(matches!(err, DataCacheError::InvalidBlockHeader(_)));
 
         // Get data that's not been written yet
         let result = cache
-            .get_block(&cache_key_non_existent, 0, 0, data.len())
+            .get_block(cache_key_non_existent.clone(), 0, 0, data.len())
             .await
             .expect("cache should return None if data is not present");
         assert_eq!(result, None);

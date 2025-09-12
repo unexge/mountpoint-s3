@@ -134,59 +134,94 @@ where
     ) {
         let cache_key = &self.config.object_id;
         let block_size = self.cache.block_size();
-        let block_range = self.block_indices_for_byte_range(&range);
+        let object_size = range.object_size();
 
-        // Scan the blocks and feed them from the cache. If a block is missing or invalid,
-        // start a GetObject request on the client for the remainder of the stream.
-        // We could check for missing blocks in advance and pre-emptively start a GetObject
-        // request, but since this stream is already behind the prefetcher, the delay is
-        // already likely negligible.
-        let mut block_offset = block_range.start * block_size;
-        for block_index in block_range.clone() {
-            match self
-                .cache
-                .get_block(cache_key, block_index, block_offset, range.object_size())
-                .await
-            {
-                Ok(Some(block)) => {
-                    trace!(?cache_key, ?range, block_index, "cache hit");
-                    // Cache blocks always contain bytes in the request range
-                    let part = try_make_part(&block, block_offset, cache_key, &range).unwrap();
-                    part_queue_producer.push(Ok(part));
-                    block_offset += block_size;
+        let Range {
+            start: block_start,
+            end: block_end,
+        } = self.block_indices_for_byte_range(&range);
 
-                    if let Err(e) = self
-                        .backpressure_limiter
-                        .wait_for_read_window_increment(block_offset)
-                        .await
-                    {
-                        part_queue_producer.push(Err(e));
-                        break;
-                    }
-                    continue;
+        let mut block_curr = block_start;
+        'read_blocks: while block_curr < block_end {
+            let read_window_num_blocks = self.num_blocks_to_read_in_current_read_window();
+            tracing::debug!(
+                num_blocks = read_window_num_blocks,
+                read_window = self.backpressure_limiter.read_window_end_offset(),
+                block_size = self.cache.block_size(),
+                object_size = object_size,
+                "prefetching cache blocks"
+            );
+            let blocks_to_read = (block_curr..(block_curr + read_window_num_blocks).min(block_end))
+                .map(|block_idx| (block_idx * block_size)..((block_idx + 1) * block_size))
+                .collect::<Vec<_>>();
+
+            let blocks = match self.cache.get_blocks(cache_key.clone(), &blocks_to_read, object_size) {
+                Ok(blocks) => blocks,
+                Err(error) => {
+                    warn!(
+                        cache_key = ?&self.config.object_id,
+                        block_curr,
+                        ?range,
+                        ?error,
+                        "error reading block from cache, falling back to S3",
+                    );
+                    break 'read_blocks;
                 }
-                Ok(None) => trace!(?cache_key, block_index, ?range, "cache miss - no data for block"),
-                Err(error) => warn!(
-                    ?cache_key,
-                    block_index,
-                    ?range,
-                    ?error,
-                    "error reading block from cache, falling back to S3",
-                ),
+            };
+            for block in blocks {
+                match block {
+                    Ok(Some(block)) => {
+                        trace!(cache_key = ?&self.config.object_id, ?range, block_curr, "cache hit");
+                        // Cache blocks always contain bytes in the request range
+                        let part =
+                            try_make_part(&block, block_curr * block_size, &self.config.object_id, &range).unwrap();
+                        part_queue_producer.push(Ok(part));
+                        block_curr += 1;
+
+                        if let Err(e) = self
+                            .backpressure_limiter
+                            .wait_for_read_window_increment(block_curr * block_size)
+                            .await
+                        {
+                            // If we got an error from backpressure limiter, stop reading without falling back to S3.
+                            part_queue_producer.push(Err(e));
+                            return;
+                        }
+                    }
+                    Ok(None) => {
+                        trace!(cache_key = ?&self.config.object_id, block_curr, ?range, "cache miss - no data for block");
+                        break 'read_blocks;
+                    }
+                    Err(error) => {
+                        warn!(
+                            cache_key = ?&self.config.object_id,
+                            block_start,
+                            ?range,
+                            ?error,
+                            "error reading block from cache, falling back to S3",
+                        );
+                        break 'read_blocks;
+                    }
+                }
             }
-            // If a block is uncached or reading it fails, fallback to S3 for the rest of the stream.
-            metrics::counter!("prefetch.blocks_served_from_cache").increment(block_index - block_range.start);
-            metrics::counter!("prefetch.blocks_requested_to_client").increment(block_range.end - block_index);
-            return self
-                .get_from_client(
-                    range.trim_start(block_offset),
-                    block_index..block_range.end,
-                    part_queue_producer,
-                )
-                .await;
         }
-        // We served the whole range from cache.
-        metrics::counter!("prefetch.blocks_served_from_cache").increment(block_range.end - block_range.start);
+
+        if block_curr == block_end {
+            // We already read all the data, no need to fallback to S3
+            return;
+        }
+
+        // If a block is uncached or reading it fails, fallback to S3 for the rest of the stream.
+        metrics::counter!("prefetch.blocks_served_from_cache").increment(block_curr - block_start);
+        metrics::counter!("prefetch.blocks_requested_to_client").increment(block_end - block_curr);
+        tracing::warn!(start = block_curr * block_size, "failling back to s3");
+        return self
+            .get_from_client(
+                range.trim_start(block_curr * block_size),
+                block_curr..block_size,
+                part_queue_producer,
+            )
+            .await;
     }
 
     async fn get_from_client(
@@ -233,6 +268,11 @@ where
             runtime: self.runtime.clone(),
         };
         part_composer.try_compose_parts(request_stream, range).await;
+    }
+
+    fn num_blocks_to_read_in_current_read_window(&self) -> u64 {
+        let block_size = self.cache.block_size();
+        self.backpressure_limiter.read_window_end_offset() / block_size
     }
 
     fn block_indices_for_byte_range(&self, range: &RequestRange) -> Range<BlockIndex> {

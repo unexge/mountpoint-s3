@@ -10,6 +10,8 @@ mod express_data_cache;
 mod in_memory_data_cache;
 mod multilevel_cache;
 
+use std::ops::Range;
+
 use async_trait::async_trait;
 use thiserror::Error;
 
@@ -24,6 +26,8 @@ use crate::object::ObjectId;
 
 /// Indexes blocks within a given object.
 pub type BlockIndex = u64;
+
+pub type BlockRange = Range<BlockIndex>;
 
 /// Errors returned by operations on a [DataCache]
 #[derive(Debug, Error)]
@@ -68,11 +72,21 @@ pub trait DataCache {
     /// Operation may fail due to errors, or return [None] if the block was not available in the cache.
     async fn get_block(
         &self,
-        cache_key: &ObjectId,
+        cache_key: ObjectId,
         block_idx: BlockIndex,
         block_offset: u64,
         object_size: usize,
     ) -> DataCacheResult<Option<ChecksummedBytes>>;
+
+    /// Get multiple blocks of data from the cache for the given [ObjectId] and [BlockRange]s, if available.
+    fn get_blocks(
+        &self,
+        _cache_key: ObjectId,
+        _block_ranges: &[BlockRange],
+        _object_size: usize,
+    ) -> DataCacheResult<Vec<DataCacheResult<Option<ChecksummedBytes>>>> {
+        unimplemented!()
+    }
 
     /// Put block of data to the cache for the given [ObjectId] and [BlockIndex].
     async fn put_block(

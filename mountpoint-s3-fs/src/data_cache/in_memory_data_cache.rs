@@ -35,7 +35,7 @@ impl InMemoryDataCache {
 impl DataCache for InMemoryDataCache {
     async fn get_block(
         &self,
-        cache_key: &ObjectId,
+        cache_key: ObjectId,
         block_idx: BlockIndex,
         block_offset: u64,
         _object_size: usize,
@@ -44,7 +44,7 @@ impl DataCache for InMemoryDataCache {
             return Err(DataCacheError::InvalidBlockOffset);
         }
         let data = self.data.read().unwrap();
-        let block_data = data.get(cache_key).and_then(|blocks| blocks.get(&block_idx)).cloned();
+        let block_data = data.get(&cache_key).and_then(|blocks| blocks.get(&block_idx)).cloned();
         Ok(block_data)
     }
 
@@ -95,7 +95,7 @@ mod tests {
         let cache_key_2 = ObjectId::new("b".into(), ETag::for_tests());
 
         let block = cache
-            .get_block(&cache_key_1, 0, 0, object_1_size)
+            .get_block(cache_key_1.clone(), 0, 0, object_1_size)
             .await
             .expect("cache is accessible");
         assert!(
@@ -109,7 +109,7 @@ mod tests {
             .await
             .expect("cache is accessible");
         let entry = cache
-            .get_block(&cache_key_1, 0, 0, object_1_size)
+            .get_block(cache_key_1.clone(), 0, 0, object_1_size)
             .await
             .expect("cache is accessible")
             .expect("cache entry should be returned");
@@ -124,7 +124,7 @@ mod tests {
             .await
             .expect("cache is accessible");
         let entry = cache
-            .get_block(&cache_key_2, 0, 0, object_2_size)
+            .get_block(cache_key_2.clone(), 0, 0, object_2_size)
             .await
             .expect("cache is accessible")
             .expect("cache entry should be returned");
@@ -139,7 +139,7 @@ mod tests {
             .await
             .expect("cache is accessible");
         let entry = cache
-            .get_block(&cache_key_1, 1, block_size, object_1_size)
+            .get_block(cache_key_1.clone(), 1, block_size, object_1_size)
             .await
             .expect("cache is accessible")
             .expect("cache entry should be returned");
@@ -150,7 +150,7 @@ mod tests {
 
         // Entry 1's first block still intact
         let entry = cache
-            .get_block(&cache_key_1, 0, 0, object_1_size)
+            .get_block(cache_key_1.clone(), 0, 0, object_1_size)
             .await
             .expect("cache is accessible")
             .expect("cache entry should be returned");

@@ -1,16 +1,21 @@
 //! Module for the on-disk data cache implementation.
 
+use std::collections::{HashMap, VecDeque};
+use std::ffi::CString;
 use std::fs;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{Cursor, ErrorKind, Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
 use bincode::config::{Configuration, Fixint, Limit, LittleEndian};
 use bincode::error::{DecodeError, EncodeError};
 use bincode::{Decode, Encode};
-use bytes::Bytes;
+use bytes::{Buf, Bytes, BytesMut};
+use io_uring::{IoUring, opcode, types};
 use linked_hash_map::LinkedHashMap;
 use mountpoint_s3_client::checksums::crc32c::{self, Crc32c};
 use sha2::{Digest, Sha256};
@@ -19,7 +24,7 @@ use thiserror::Error;
 use tracing::{trace, warn};
 
 use crate::checksums::IntegrityError;
-use crate::data_cache::DataCacheError;
+use crate::data_cache::{BlockRange, DataCacheError};
 use crate::memory::{BufferKind, PagedPool};
 use crate::object::ObjectId;
 use crate::sync::Mutex;
@@ -38,6 +43,7 @@ pub struct DiskDataCache {
     pool: PagedPool,
     /// Tracks blocks usage. `None` when no cache limit was set.
     usage: Option<Mutex<UsageInfo<DiskBlockKey>>>,
+    fetcher: Arc<Mutex<CacheBlockFetcher>>,
 }
 
 /// Configuration for a [DiskDataCache].
@@ -192,7 +198,11 @@ impl DiskBlockHeader {
         } else {
             warn!(
                 s3_key_match,
-                etag_match, block_idx_match, block_size_match, "block data did not match expected values",
+                etag_match,
+                block_idx_match,
+                block_offset_match,
+                block_size_match,
+                "block data did not match expected values",
             );
             Err(DiskBlockAccessError::FieldMismatchError)
         }
@@ -311,7 +321,15 @@ impl DiskDataCache {
             CacheLimit::Unbounded => None,
             CacheLimit::TotalSize { .. } | CacheLimit::AvailableSpace { .. } => Some(Mutex::new(UsageInfo::new())),
         };
-        DiskDataCache { config, pool, usage }
+
+        let fetcher = CacheBlockFetcher::new(32);
+
+        DiskDataCache {
+            config,
+            pool,
+            usage,
+            fetcher: Arc::new(Mutex::new(fetcher)),
+        }
     }
 
     /// Get the relative path for the given block.
@@ -334,6 +352,7 @@ impl DiskDataCache {
             path = ?path.as_ref(),
             "reading cache block",
         );
+
         let mut file = match fs::File::open(path.as_ref()) {
             Ok(file) => file,
             Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
@@ -450,7 +469,7 @@ fn hash_cache_key_raw(cache_key: &ObjectId) -> [u8; 32] {
 impl DataCache for DiskDataCache {
     async fn get_block(
         &self,
-        cache_key: &ObjectId,
+        cache_key: ObjectId,
         block_idx: BlockIndex,
         block_offset: u64,
         _object_size: usize,
@@ -459,9 +478,9 @@ impl DataCache for DiskDataCache {
             return Err(DataCacheError::InvalidBlockOffset);
         }
         let start = Instant::now();
-        let block_key = DiskBlockKey::new(cache_key, block_idx);
+        let block_key = DiskBlockKey::new(&cache_key, block_idx);
         let path = self.get_path_for_block_key(&block_key);
-        match self.read_block(&path, cache_key, block_idx, block_offset) {
+        match self.read_block(&path, &cache_key, block_idx, block_offset) {
             Ok(None) => {
                 // Cache miss.
                 metrics::counter!("disk_data_cache.block_hit").increment(0);
@@ -484,6 +503,131 @@ impl DataCache for DiskDataCache {
                 Err(err)
             }
         }
+    }
+
+    fn get_blocks(
+        &self,
+        cache_key: ObjectId,
+        block_ranges: &[BlockRange],
+        _object_size: usize,
+    ) -> DataCacheResult<Vec<DataCacheResult<Option<ChecksummedBytes>>>> {
+        assert!(block_ranges.len() > 0);
+        let start = Instant::now();
+
+        for block_range in block_ranges {
+            if (block_range.end - block_range.start) != self.config.block_size {
+                return Err(DataCacheError::InvalidBlockOffset);
+            }
+        }
+
+        const S3_KEY_MAX_SIZE: usize = 2048;
+        let block_file_size = self.config.block_size as usize
+            + std::mem::size_of::<DiskBlockHeader>()
+            + S3_KEY_MAX_SIZE
+            + CACHE_VERSION.len();
+        let total_size = block_file_size * block_ranges.len();
+
+        let mut buf = BytesMut::zeroed(total_size + 1024);
+
+        let paths_and_buffers = block_ranges
+            .iter()
+            .map(|block_range| {
+                let chunk = buf.split_to(block_file_size);
+                assert_eq!(chunk.len(), block_file_size);
+                let block_size = block_range.end - block_range.start;
+                let block_idx = block_range.start / block_size;
+                let block_key = DiskBlockKey::new(&cache_key.clone(), block_idx);
+                (self.get_path_for_block_key(&block_key), chunk)
+            })
+            .collect::<Vec<_>>();
+
+        let path_orders: HashMap<PathBuf, usize> = HashMap::from_iter(
+            paths_and_buffers
+                .as_slice()
+                .iter()
+                .enumerate()
+                .map(|(i, path)| (path.0.to_owned(), i)),
+        );
+
+        let mut fetcher = self.fetcher.lock().unwrap();
+        warn!(size = paths_and_buffers.len(), took = ?start.elapsed(), "pushed paths");
+        fetcher.push(paths_and_buffers);
+
+        let mut results: Vec<DataCacheResult<Option<ChecksummedBytes>>> = Vec::with_capacity(path_orders.len());
+        for _ in 0..path_orders.len() {
+            results.push(Ok(None));
+        }
+
+        let mut i = 0;
+        let mut all_results: Vec<CacheBlock> = Vec::with_capacity(path_orders.len());
+        while i < path_orders.len() {
+            let Some(result) = fetcher.pop() else {
+                continue;
+            };
+
+            i += 1;
+            all_results.push(result);
+        }
+        warn!(size = path_orders.len(), took = ?start.elapsed(), "fetched blocks");
+
+        let before_checksum = Instant::now();
+
+        for result in all_results {
+            match result {
+                CacheBlock::NotFound { path } => {
+                    let idx = path_orders.get(&path).unwrap();
+                    results[*idx] = Ok(None);
+                }
+                CacheBlock::FailedToRead { path, error } => {
+                    let idx = path_orders.get(&path).unwrap();
+                    results[*idx] = Err(DataCacheError::IoFailure(error.into()));
+                }
+                CacheBlock::Data { path, buf } => {
+                    assert_eq!(buf.len(), block_file_size);
+
+                    let idx = path_orders.get(&path).unwrap();
+
+                    let block_version = &buf[0..CACHE_VERSION.len()];
+                    if block_version != CACHE_VERSION.as_bytes() {
+                        warn!(
+                            found_version = ?block_version, expected_version = ?CACHE_VERSION,
+                            path = ?path,
+                            "stale block format found during reading"
+                        );
+                        results[*idx] = Err(DataCacheError::InvalidBlockContent);
+                        continue;
+                    }
+
+                    let block_data = buf.slice(CACHE_VERSION.len()..);
+                    let block = match DiskBlock::read(&mut block_data.reader(), self.block_size(), &self.pool) {
+                        Ok(block) => block,
+                        Err(error) => {
+                            warn!(?error, path = ?path, "block could not be deserialized");
+                            results[*idx] = Err(DataCacheError::InvalidBlockContent);
+                            continue;
+                        }
+                    };
+
+                    let block_range = &block_ranges[*idx];
+                    let block_size = block_range.end - block_range.start;
+                    let block_idx = block_range.start / block_size;
+                    let block_offset = block_range.start;
+                    let bytes = match block.data(&cache_key, block_idx, block_offset) {
+                        Ok(bytes) => bytes,
+                        Err(_) => {
+                            results[*idx] = Err(DataCacheError::InvalidBlockContent);
+                            continue;
+                        }
+                    };
+
+                    results[*idx] = Ok(Some(bytes));
+                }
+            }
+        }
+
+        warn!(size = path_orders.len(), took = ?start.elapsed(), took_checksums = ?before_checksum.elapsed(), "get blocks");
+
+        Ok(results)
     }
 
     async fn put_block(
@@ -532,6 +676,175 @@ impl DataCache for DiskDataCache {
 
     fn block_size(&self) -> u64 {
         self.config.block_size
+    }
+}
+
+#[derive(Debug)]
+enum CacheBlockFetch {
+    Open { path: CString, buf: BytesMut },
+    Read { path: CString, buf: BytesMut, fd: i32 },
+    Close { fd: i32 },
+}
+
+#[derive(Debug)]
+enum CacheBlock {
+    NotFound { path: PathBuf },
+    FailedToRead { path: PathBuf, error: std::io::Error },
+    Data { path: PathBuf, buf: Bytes },
+}
+
+struct CacheBlockFetcher {
+    io_uring: IoUring,
+    queue: VecDeque<CacheBlockFetch>,
+    inflight: Vec<CacheBlockFetch>,
+    inflight_buf: Vec<BytesMut>,
+    inflight_idx: VecDeque<usize>,
+    result: VecDeque<CacheBlock>,
+}
+
+impl CacheBlockFetcher {
+    fn new(ring_size: u32) -> CacheBlockFetcher {
+        let mut inflight_idx = VecDeque::with_capacity(ring_size as _);
+        for i in 0..ring_size {
+            inflight_idx.push_back(i as _);
+        }
+
+        let mut inflight = Vec::with_capacity(ring_size as _);
+        // Prefill the buffer with a dummy variant
+        for _ in 0..ring_size {
+            inflight.push(CacheBlockFetch::Close { fd: 0 });
+        }
+
+        let mut inflight_buf = Vec::with_capacity(ring_size as _);
+        for _ in 0..ring_size {
+            inflight_buf.push(BytesMut::new());
+        }
+
+        CacheBlockFetcher {
+            io_uring: IoUring::new(ring_size).unwrap(),
+            queue: VecDeque::with_capacity(1024),
+            inflight,
+            inflight_buf,
+            inflight_idx,
+            result: VecDeque::with_capacity(1024),
+        }
+    }
+
+    fn push(&mut self, paths_and_bufs: Vec<(PathBuf, BytesMut)>) {
+        self.queue
+            .extend(paths_and_bufs.into_iter().map(|(path, buf)| CacheBlockFetch::Open {
+                path: CString::new(path.as_os_str().as_bytes()).unwrap(),
+                buf,
+            }));
+        self.work();
+    }
+
+    fn pop(&mut self) -> Option<CacheBlock> {
+        if self.result.is_empty() {
+            self.work();
+        }
+
+        self.result.pop_front()
+    }
+
+    fn work(&mut self) {
+        let (submission, mut sq, cq) = self.io_uring.split();
+
+        // The queue is full, submit it to the kernel
+        if sq.is_full() {
+            submission.submit().unwrap();
+        }
+
+        // Process completion queue
+        for entry in cq {
+            let idx = entry.user_data() as usize;
+            self.inflight_idx.push_back(idx);
+            let cache_block_fetch = std::mem::replace(&mut self.inflight[idx], CacheBlockFetch::Close { fd: 0 });
+            match cache_block_fetch {
+                CacheBlockFetch::Open { path, buf } => {
+                    let fd = entry.result();
+                    if fd < 0 {
+                        // Cache block not found, cache miss
+                        self.result.push_back(CacheBlock::NotFound {
+                            path: PathBuf::from(path.into_string().unwrap()),
+                        });
+                        continue;
+                    }
+
+                    self.queue.push_back(CacheBlockFetch::Read { path, buf, fd });
+                }
+                CacheBlockFetch::Read { path, fd, .. } => {
+                    let n = entry.result();
+                    if n < 0 {
+                        // Failed to read, io error
+                        self.result.push_back(CacheBlock::FailedToRead {
+                            path: PathBuf::from(path.into_string().unwrap()),
+                            error: std::io::Error::from_raw_os_error(-n),
+                        });
+                        continue;
+                    }
+
+                    let buf = std::mem::replace(&mut self.inflight_buf[idx], BytesMut::new());
+                    self.result.push_back(CacheBlock::Data {
+                        path: PathBuf::from(path.into_string().unwrap()),
+                        buf: buf.freeze(),
+                    });
+                    self.queue.push_back(CacheBlockFetch::Close { fd });
+                }
+                CacheBlockFetch::Close { fd } => {
+                    assert_ne!(fd, 0);
+                }
+            }
+        }
+
+        // Process work queue
+        while let Some(mut work) = self.queue.pop_front() {
+            let Some(idx) = self.inflight_idx.pop_front() else {
+                self.queue.push_front(work);
+                // That means we don't have any capacity in the buffer
+                break;
+            };
+
+            if let CacheBlockFetch::Read { ref mut buf, .. } = work {
+                self.inflight_buf[idx] = std::mem::replace(buf, BytesMut::new());
+            }
+
+            self.inflight[idx] = work;
+            match &self.inflight[idx] {
+                CacheBlockFetch::Open { path, .. } => {
+                    let pathname = path.as_ptr();
+                    let entry = opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), pathname)
+                        .build()
+                        .user_data(idx as _);
+
+                    // SAFETY: The pathname is valid for the duration of the ring.
+                    unsafe {
+                        sq.push(&entry).unwrap();
+                    }
+                }
+                CacheBlockFetch::Read { fd, .. } => {
+                    let buf = &mut self.inflight_buf[idx];
+                    let entry = opcode::Read::new(types::Fd(*fd), buf.as_mut_ptr(), buf.len() as _)
+                        .build()
+                        .user_data(idx as _);
+
+                    // SAFETY: The buffer and the fd are valid for the duration of the ring.
+                    unsafe {
+                        sq.push(&entry).unwrap();
+                    }
+                }
+                CacheBlockFetch::Close { fd } => {
+                    let entry = opcode::Close::new(types::Fd(*fd)).build().user_data(idx as _);
+                    // SAFETY: The fd is valid.
+                    unsafe {
+                        sq.push(&entry).unwrap();
+                    }
+                }
+            }
+        }
+
+        // Submit the queue after adding some work
+        submission.submit().unwrap();
     }
 }
 
@@ -750,7 +1063,7 @@ mod tests {
         );
 
         let block = cache
-            .get_block(&cache_key_1, 0, 0, object_1_size)
+            .get_block(cache_key_1.clone(), 0, 0, object_1_size)
             .await
             .expect("cache should be accessible");
         assert!(
@@ -764,7 +1077,7 @@ mod tests {
             .await
             .expect("cache should be accessible");
         let entry = cache
-            .get_block(&cache_key_1, 0, 0, object_1_size)
+            .get_block(cache_key_1.clone(), 0, 0, object_1_size)
             .await
             .expect("cache should be accessible")
             .expect("cache entry should be returned");
@@ -779,7 +1092,7 @@ mod tests {
             .await
             .expect("cache should be accessible");
         let entry = cache
-            .get_block(&cache_key_2, 0, 0, object_2_size)
+            .get_block(cache_key_2, 0, 0, object_2_size)
             .await
             .expect("cache should be accessible")
             .expect("cache entry should be returned");
@@ -794,7 +1107,7 @@ mod tests {
             .await
             .expect("cache should be accessible");
         let entry = cache
-            .get_block(&cache_key_1, 1, block_size, object_1_size)
+            .get_block(cache_key_1.clone(), 1, block_size, object_1_size)
             .await
             .expect("cache should be accessible")
             .expect("cache entry should be returned");
@@ -805,7 +1118,7 @@ mod tests {
 
         // Entry 1's first block still intact
         let entry = cache
-            .get_block(&cache_key_1, 0, 0, object_1_size)
+            .get_block(cache_key_1.clone(), 0, 0, object_1_size)
             .await
             .expect("cache should be accessible")
             .expect("cache entry should be returned");
@@ -837,7 +1150,7 @@ mod tests {
             .await
             .expect("cache should be accessible");
         let entry = cache
-            .get_block(&cache_key, 0, 0, slice.len())
+            .get_block(cache_key, 0, 0, slice.len())
             .await
             .expect("cache should be accessible")
             .expect("cache entry should be returned");
@@ -865,7 +1178,7 @@ mod tests {
 
         async fn is_block_in_cache(
             cache: &DiskDataCache,
-            cache_key: &ObjectId,
+            cache_key: ObjectId,
             block_idx: u64,
             expected_bytes: &ChecksummedBytes,
             object_size: usize,
@@ -943,7 +1256,13 @@ mod tests {
 
         let count_small_object_blocks_in_cache = futures::stream::iter(small_object_blocks.iter().enumerate())
             .filter(|&(block_idx, bytes)| {
-                is_block_in_cache(&cache, &small_object_key, block_idx as u64, bytes, SMALL_OBJECT_SIZE)
+                is_block_in_cache(
+                    &cache,
+                    small_object_key.clone(),
+                    block_idx as u64,
+                    bytes,
+                    SMALL_OBJECT_SIZE,
+                )
             })
             .count()
             .await;
@@ -955,7 +1274,13 @@ mod tests {
 
         let count_large_object_blocks_in_cache = futures::stream::iter(large_object_blocks.iter().enumerate())
             .filter(|&(block_idx, bytes)| {
-                is_block_in_cache(&cache, &large_object_key, block_idx as u64, bytes, LARGE_OBJECT_SIZE)
+                is_block_in_cache(
+                    &cache,
+                    large_object_key.clone(),
+                    block_idx as u64,
+                    bytes,
+                    LARGE_OBJECT_SIZE,
+                )
             })
             .count()
             .await;
@@ -1128,7 +1453,7 @@ mod tests {
             let handle = pool
                 .spawn_with_handle(async move {
                     let block = data_cache
-                        .get_block(&cache_key, block_idx, block_offset, object_size)
+                        .get_block(cache_key.clone(), block_idx, block_offset, object_size)
                         .await
                         .expect("get_block should not return error");
                     if block.is_none() {

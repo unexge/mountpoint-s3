@@ -6,7 +6,7 @@ time_based
 group_reporting
 
 [sequential_read_four_threads]
-size=100G
+size=1G
 rw=read
 ioengine=sync
 fallocate=none
